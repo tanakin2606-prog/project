@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Posture Alert - โปรแกรมเตือนนั่งหลังค่อม</title>
+    <!-- โหลดไลบรารีสร้าง QR Code -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <!-- โหลดไลบรารี AI สำหรับจับการเคลื่อนไหว (TensorFlow.js & PoseDetection) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+    <style>
+        body { font-family: 'Kanit', sans-serif; text-align: center; background-color: #f4f7f6; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; }
+        #desktop-view, #mobile-view { display: none; }
+        #qrcode { display: flex; justify-content: center; margin: 20px 0; }
+        video, canvas { max-width: 100%; border-radius: 10px; transform: scaleX(-1); /* สลับซ้ายขวาเหมือนกระจก */ }
+        .btn { background-color: #27ae60; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 8px; cursor: pointer; margin-top: 15px; }
+        .btn:hover { background-color: #2ecc71; }
+        #status { margin-top: 15px; font-size: 20px; font-weight: bold; }
+        .alert { color: #e74c3c; }
+        .good { color: #27ae60; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🧘‍♂️ Posture Alert</h1>
+
+    <!-- ส่วนที่ 1: แสดงบนหน้าจอคอมพิวเตอร์ -->
+    <div id="desktop-view">
+        <p>ใช้โทรศัพท์มือถือสแกน QR Code ด้านล่างนี้<br>เพื่อเปิดกล้องและเริ่มระบบจับท่านั่ง</p>
+        <div id="qrcode"></div>
+    </div>
+
+    <!-- ส่วนที่ 2: แสดงบนหน้าจอมือถือ -->
+    <div id="mobile-view">
+        <p>ตั้งกล้องมือถือให้เห็นใบหน้าและช่วงไหล่</p>
+        <div style="position: relative;">
+            <video id="video" playsinline autoplay></video>
+            <canvas id="canvas" style="position: absolute; top: 0; left: 0;"></canvas>
+        </div>
+        <button id="set-baseline-btn" class="btn">🎯 บันทึกท่านั่งหลังตรง (เริ่มจับผิด)</button>
+        <div id="status">กำลังโหลดระบบ AI...</div>
+    </div>
+</div>
+
+<script>
+    // ตรวจสอบว่าเป็นมือถือหรือคอมพิวเตอร์
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    
+    if (!isMobile) {
+        // --- ระบบบนจอคอมพิวเตอร์ ---
+        document.getElementById('desktop-view').style.display = 'block';
+        // สร้าง QR Code จาก URL ปัจจุบัน
+        const currentUrl = window.location.href;
+        new QRCode(document.getElementById("qrcode"), {
+            text: currentUrl,
+            width: 250,
+            height: 250,
+        });
+    } else {
+        // --- ระบบบนจอมือถือ ---
+        document.getElementById('mobile-view').style.display = 'block';
+        
+        const video = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+        const btn = document.getElementById('set-baseline-btn');
+        
+        let detector;
+        let baselineY = null;
+        let isAlerting = false;
+
+        // เสียงเตือน
+        const beepContext = new (window.AudioContext || window.webkitAudioContext)();
+        function playAlertSound() {
+            if (isAlerting) return;
+            isAlerting = true;
+            
+            // ทำให้โทรศัพท์สั่น
+            if (navigator.vibrate) navigator.vibrate([200, 100, 200]); 
+
+            // สร้างเสียงบิ๊บ
+            const oscillator = beepContext.createOscillator();
+            oscillator.type = 'square';
+            oscillator.frequency.setValueAtTime(440, beepContext.currentTime); // 440 Hz
+            oscillator.connect(beepContext.destination);
+            oscillator.start();
+            oscillator.stop(beepContext.currentTime + 0.5);
+
+            setTimeout(() => isAlerting = false, 2000); // เว้นระยะเตือน
+        }
+
+        // เปิดกล้องหน้า
+        async function setupCamera() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'user' },
+                audio: false
+            });
+            video.srcObject = stream;
+            return new Promise((resolve) => {
+                video.onloadedmetadata = () => resolve(video);
+            });
+        }
+
+        // โหลดโมเดล AI
+        async function initAI() {
+            await setupCamera();
+            video.play();
+            statusEl.innerText = "กำลังเตรียม AI...";
+            
+            const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
+            detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+            
+            statusEl.innerText = "พร้อมใช้งาน! ให้นั่งหลังตรงแล้วกดปุ่ม";
+            detectPose();
+        }
+
+        // ฟังก์ชันประมวลผลท่าทางวนลูป
+        async function detectPose() {
+            if (detector) {
+                const poses = await detector.estimatePoses(video);
+                if (poses.length > 0) {
+                    // ดึงตำแหน่งของ "จมูก" เพื่อดูว่าก้มหน้าหรือตัวหดลงมาหรือไม่
+                    const nose = poses[0].keypoints.find(k => k.name === 'nose');
+                    
+                    if (nose && nose.score > 0.5) {
+                        // ถ้าตั้งค่าท่านั่งมาตรฐานไว้แล้ว
+                        if (baselineY !== null) {
+                            // ถ้านั่งหลังค่อม หัวจะต่ำลง (แกน Y ในหน้าจอจะเพิ่มขึ้น)
+                            // เลข 40 คือระยะความยืดหยุ่น (Pixel) ปรับค่านี้ได้ตามความเหมาะสม
+                            if (nose.y > baselineY + 40) {
+                                statusEl.innerHTML = '<span class="alert">⚠️ คุณกำลังนั่งหลังค่อม! ยืดตัวขึ้น</span>';
+                                playAlertSound();
+                            } else {
+                                statusEl.innerHTML = '<span class="good">✅ ท่านั่งเยี่ยมมาก</span>';
+                            }
+                        }
+                    }
+                }
+            }
+            requestAnimationFrame(detectPose);
+        }
+
+        // กดปุ่มเพื่อจำท่านั่งมาตรฐาน
+        btn.addEventListener('click', async () => {
+            if (!detector) return;
+            statusEl.innerText = "กำลังวิเคราะห์ท่าทาง...";
+            const poses = await detector.estimatePoses(video);
+            if (poses.length > 0) {
+                const nose = poses[0].keypoints.find(k => k.name === 'nose');
+                if (nose && nose.score > 0.5) {
+                    baselineY = nose.y; // บันทึกความสูงของใบหน้า
+                    statusEl.innerHTML = '<span class="good">✅ บันทึกท่านั่งหลังตรงเรียบร้อย!</span>';
+                    btn.innerText = "ตั้งค่าท่านั่งใหม่";
+                } else {
+                    statusEl.innerText = "❌ มองไม่เห็นใบหน้า กรุณาขยับกล้อง";
+                }
+            }
+        });
+
+        initAI();
+    }
+</script>
+
+</body>
+</html>
